@@ -2,6 +2,13 @@
 
 [English](README.md)
 
+## 数学流程 PDF
+
+- [中文版](output/pdf/two_step_gate_grpo_zh.pdf)
+- [English edition](output/pdf/two_step_gate_grpo_en.pdf)
+
+两份 PDF 用公式和简短文字说明当前两步门控 GRPO 方法及更新规则，包含第 1–6 部分，尚无实验结果。
+
 本项目拟推广 GRPO，使其在长程轨迹、尤其是 code agent 任务中，能够重新分配每一步的奖励信号，从而更好地对模型进行梯度更新。
 
 1. **基于状态的局部奖励调整。** 对于一个固定状态，收集所有经过该状态的历史轨迹，考察在该状态下已有下一步选择的 token 熵，再结合图结构及轨迹之间的相对关系，优化这一步的奖励信号。
