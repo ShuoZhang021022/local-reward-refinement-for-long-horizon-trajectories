@@ -2,12 +2,11 @@
 
 [中文版](README.zh-CN.md)
 
-## Mathematical method PDFs
+## Mathematical method PDF
 
-- [English edition](output/pdf/two_step_gate_grpo_en.pdf)
-- [中文版](output/pdf/two_step_gate_grpo_zh.pdf)
+- [English method note](output/pdf/two_step_gate_grpo_en.pdf)
 
-The PDFs describe the current two-step gated GRPO method through its update rule. They contain sections 1–6 and no experimental results.
+The PDF describes the current two-step gated GRPO method through its update rule. It contains sections 1–6 and no experimental results.
 
 This project explores an extension of GRPO for long-horizon trajectories, especially code agents. The goal is to redistribute reward signals across steps so that gradient updates better reflect the contribution of each step.
 

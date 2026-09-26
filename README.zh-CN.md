@@ -2,12 +2,11 @@
 
 [English](README.md)
 
-## 数学流程 PDF
+## 数学流程 PDF（英文）
 
-- [中文版](output/pdf/two_step_gate_grpo_zh.pdf)
-- [English edition](output/pdf/two_step_gate_grpo_en.pdf)
+- [英文版方法说明](output/pdf/two_step_gate_grpo_en.pdf)
 
-两份 PDF 用公式和简短文字说明当前两步门控 GRPO 方法及更新规则，包含第 1–6 部分，尚无实验结果。
+该 PDF 用公式和简短文字说明当前两步门控 GRPO 方法及更新规则，包含第 1–6 部分，尚无实验结果。
 
 本项目拟推广 GRPO，使其在长程轨迹、尤其是 code agent 任务中，能够重新分配每一步的奖励信号，从而更好地对模型进行梯度更新。
 
