@@ -1,0 +1,170 @@
+% \usepackage{enumitem}
+% \usepackage{amsmath}
+% \usepackage{amsthm}
+\usepackage{bbm}
+
+% Align Block
+\newcommand\numberthis{\addtocounter{equation}{1}\tag{\theequation}}
+\allowdisplaybreaks
+
+\usepackage{mathtools}
+
+% Math delimiters
+\DeclarePairedDelimiter{\abs}{\lvert}{\rvert}
+\DeclarePairedDelimiter{\brk}{[}{]}
+\DeclarePairedDelimiter{\crl}{\{}{\}}
+\DeclarePairedDelimiter{\prn}{(}{)}
+\DeclarePairedDelimiter{\nrm}{\|}{\|}
+\DeclarePairedDelimiter{\tri}{\langle}{\rangle}
+\DeclarePairedDelimiter{\dtri}{\llangle}{\rrangle}
+\DeclarePairedDelimiter{\ceil}{\lceil}{\rceil}
+\DeclarePairedDelimiter{\floor}{\lfloor}{\rfloor}
+\newcommand{\midsem}{\,;}
+\newcommand{\trc}[1]{\text{tr} \prn*{#1}}
+
+\let\Pr\undefined
+\let\P\undefined
+\DeclareMathOperator{\En}{\mathbb{E}}
+\newcommand{\Ep}{\wt{\bbE}}
+%\DeclareMathOperator*{\Eh}{\widehat{\mathbb{E}}}
+\DeclareMathOperator{\P}{P}
+\DeclareMathOperator{\Pr}{\bbP}
+
+% Arg<x>
+\DeclareMathOperator*{\argmin}{argmin} % * Places subscript directly under operator
+\DeclareMathOperator*{\argmax}{argmax}
+\DeclareMathOperator*{\arginf}{arginf}
+\DeclareMathOperator*{\argsup}{argsup}
+
+% one-off macros
+\newcommand{\ls}{\ell}
+\newcommand{\bls}{\mb{\ls}}
+\newcommand{\ind}[1]{\mathbbm{1}\crl*{#1}}    %Indicator
+\newcommand{\indd}[1]{\mathbbm{1}\crl{#1}}    %Indicator
+\newcommand{\eps}{\varepsilon}
+\newcommand{\veps}{\varepsilon}
+
+\newcommand{\ldef}{\vcentcolon=}
+\newcommand{\rdef}{=\vcentcolon}
+
+% styles
+\newcommand{\mc}[1]{\mathcal{#1}}
+\newcommand{\wt}[1]{\widetilde{#1}}
+\newcommand{\wh}[1]{\widehat{#1}}
+%\newcommand{\mb}[1]{\boldsymbol{#1}}
+
+
+% Special letters: blackboard, mathcal, widehat
+% djhsu magic
+\def\ddefloop#1{\ifx\ddefloop#1\else\ddef{#1}\expandafter\ddefloop\fi}
+\def\ddef#1{\expandafter\def\csname bb#1\endcsname{\ensuremath{\mathbb{#1}}}}
+\ddefloop ABCDEFGHIJKLMNOPQRSTUVWXYZ\ddefloop
+\def\ddefloop#1{\ifx\ddefloop#1\else\ddef{#1}\expandafter\ddefloop\fi}
+\def\ddef#1{\expandafter\def\csname b#1\endcsname{\ensuremath{\mathbf{#1}}}}
+\ddefloop ABCDEFGHIJKLMNOPQRSTUVWXYZ\ddefloop
+\def\ddef#1{\expandafter\def\csname c#1\endcsname{\ensuremath{\mathcal{#1}}}}
+\ddefloop ABCDEFGHIJKLMNOPQRSTUVWXYZ\ddefloop
+\def\ddef#1{\expandafter\def\csname h#1\endcsname{\ensuremath{\widehat{#1}}}}
+\ddefloop ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrsuvwxyz\ddefloop    % Not defined for t.
+\def\ddef#1{\expandafter\def\csname hc#1\endcsname{\ensuremath{\widehat{\mathcal{#1}}}}}
+\ddefloop ABCDEFGHIJKLMNOPQRSTUVWXYZ\ddefloop
+\def\ddef#1{\expandafter\def\csname t#1\endcsname{\ensuremath{\widetilde{#1}}}}
+\ddefloop ABCDEFGHIJKLMNOPQRSTUVWXYZ\ddefloop
+\def\ddef#1{\expandafter\def\csname tc#1\endcsname{\ensuremath{\widetilde{\mathcal{#1}}}}}
+\ddefloop ABCDEFGHIJKLMNOPQRSTUVWXYZ\ddefloop
+
+% Names
+\newcommand{\Holder}{H{\"o}lder}
+
+% COMMONLY USED MACROS
+%Losses
+\newcommand{\KL}[2]{\mathrm{KL}{\prn*{#1 \| #2}}}
+\newcommand{\kl}[2]{\mathrm{kl}{\prn*{#1 \| #2}}}
+\newcommand{\ball}{\mathbb{B}}
+\newcommand{\poprisk}{L_{\cD}}
+\newcommand{\emprisk}{\wh{L}_n}
+\newcommand{\sign}{\mathrm{sign}}
+
+% Matrices
+%\newcommand{\diag}{\textrm{diag}}
+%\newcommand{\rank}{\mathrm{rank}}
+\newcommand{\trn}{\dagger}
+\newcommand{\Tr}{\mathbf{Tr}}
+
+% Special Symbols
+\newcommand{\xr}[1][n]{x_{1:#1}}
+\newcommand{\br}[1][n]{b_{1:#1}}
+\newcommand{\er}[1][n]{\eps_{1:#1}}
+\newcommand{\sr}[1][n]{\sigma_{1:#1}}
+\newcommand{\yr}[1][n]{y_{1:#1}}
+\newcommand{\zr}[1][n]{z_{1:#1}}
+\renewcommand{\th}{{\text{th}}}
+%Circled Numbers
+\usepackage{tikz}
+\newcommand*\circled[1]{\tikz[baseline=(char.base)]{
+            \node[shape=circle,draw,inner sep=2pt] (char) {#1};}}
+
+% Calculus
+\newcommand{\grad}{\nabla}
+
+\newcommand{\proman}[1]{\prn*{\romannumeral #1}}
+\newcommand{\overles}[1]{\overset{ #1}{\lesssim{}}}
+\newcommand{\overleq}[1]{\overset{ #1}{\leq{}}}
+\newcommand{\overgeq}[1]{\overset{#1}{\geq{}}}
+\newcommand{\overeq}[1]{\overset{#1}{=}}
+\newcommand{\overapx}[1]{\overset{#1}{\approx}}
+
+%%% theorems
+
+%\theoremstyle{definition}  %Sets style of subsequent newtheorems to 'definition'
+%\newtheorem{assumption}{Assumption}
+\newtheorem{condition}{Condition}
+\newtheorem{claim}{Claim}
+%\newtheorem{exercise}{Exercise}
+\newtheorem{assumption}{Assumption}
+\newtheorem{conjecture}{Conjecture}
+\newtheorem{corollary}{Corollary}
+\newtheorem{proposition}{Proposition}
+%\newtheorem{fact}{Fact}
+%\newtheorem{goal}{Goal}
+%%\newtheorem{model}{Model}
+\newtheorem{problem}{Problem}
+%\newtheorem{model}{Model}
+%\theoremstyle{plain}
+{\newtheorem{lemma}{Lemma}}
+\newtheorem{remark}{Remark}
+%\newtheorem{example}{Example}
+{\newtheorem{theorem}{Theorem}}
+\newtheorem{theorem*}{Theorem}
+\newtheorem{definition}{Definition}
+%\newtheorem{question}{Question}
+% \newtheorem{proof}{Proof}
+
+
+
+% \newtheorem*{assumption*}{\assumptionnumber}
+% \providecommand{\assumptionnumber}{}
+% \makeatletter
+% \newenvironment{spassumption}[1]
+%  {%
+%   \renewcommand{\assumptionnumber}{Assumption #1}%
+%   \begin{assumption*}%
+%   \protected@edef\@currentlabel{#1}%
+%  }
+%  {%
+%   \end{assumption*}
+%  }
+% \makeatother
+
+% \usepackage{xpatch}
+% \xpatchcmd{\proof}{\itshape}{\normalfont\proofnameformat}{}{}
+% \newcommand{\proofnameformat}{\bfseries}
+
+% The template's prettyref helpers are unused by this method note.
+% They are omitted from this copy because prettyref.sty is not available
+% in the installed TinyTeX distribution.
+
+\newcommand{\algcomment}[1]{\textcolor{blue!70!black}{\footnotesize{\texttt{\textbf{//
+          #1}}}}}
+\newcommand{\algcommentbig}[1]{\textcolor{blue!70!black}{\footnotesize{\texttt{\textbf{/*
+          #1~*/}}}}}

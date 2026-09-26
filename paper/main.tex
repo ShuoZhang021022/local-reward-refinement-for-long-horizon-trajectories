@@ -1,0 +1,254 @@
+\documentclass[10pt]{article}
+
+\input{arxiv_style}
+\input{macros}
+\input{project-macros}
+
+\title{Two-Step Gated GRPO for Long-Horizon Trajectories}
+\author{\vspace{-2em}}
+\date{September 26, 2026}
+\setlength{\parskip}{4pt}
+\AtBeginDocument{%
+  \setlength{\abovedisplayskip}{6pt}%
+  \setlength{\belowdisplayskip}{6pt}%
+  \setlength{\abovedisplayshortskip}{3pt}%
+  \setlength{\belowdisplayshortskip}{3pt}%
+}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We specify a two-step gated GRPO method for long-horizon trajectories.
+Terminal rewards are averaged within each observed action, distinct action
+means are standardized equally, and a near-zero first action receives an
+additional signal only when its successor passes a dispersion gate. We define
+the resulting advantages and clipped objective; no experiments are reported.
+\end{abstract}
+
+\section{Problem and data}
+
+Let \(\pi_{\mathrm{old}}\) be the known behavior policy, \(\tau_i\) an old
+trajectory, and \(R_i\) its terminal reward. A state \(s\) denotes the
+complete decision prefix; \(a_i(s)\) is the action taken by trajectory \(i\)
+at that state. The aim is to identify first actions with near-zero
+action-mean advantage whose successor actions show a clearer signed
+separation.
+
+\section{Action-mean advantage at a state}
+
+For any observed state \(s\), define
+\begin{equation}
+\mathcal I(s)=\{i:\tau_i\text{ visits }s\},\qquad
+K_s=|\mathcal I(s)|,\qquad
+\mathcal U(s)=\{a_i(s):i\in\mathcal I(s)\}.
+\end{equation}
+For \(u\in\mathcal U(s)\), let
+\begin{equation}
+\mathcal I(s,u)=\{i\in\mathcal I(s):a_i(s)=u\},\qquad
+n_s(u)=|\mathcal I(s,u)|,\qquad
+q_s(u)=\frac{1}{n_s(u)}\sum_{i\in\mathcal I(s,u)}R_i.
+\end{equation}
+Different observed actions then have equal weight, irrespective of their
+trajectory counts:
+\begin{equation}
+d_s=|\mathcal U(s)|,\qquad
+\bar q_s=\frac{1}{d_s}\sum_{u\in\mathcal U(s)}q_s(u),\qquad
+\sigma_{q,s}=
+\left[\frac{1}{d_s}\sum_{u\in\mathcal U(s)}
+       \bigl(q_s(u)-\bar q_s\bigr)^2\right]^{1/2}.
+\end{equation}
+The action-mean advantage is returned to every trajectory with that action:
+\begin{equation}
+A_i^{\mathrm{state}}(s)=
+\begin{cases}
+\dfrac{q_s(a_i(s))-\bar q_s}{\sigma_{q,s}},
+    &\sigma_{q,s}>0,\\[6pt]
+0, &\sigma_{q,s}=0.
+\end{cases}
+\end{equation}
+The zero-variance rule applies to the advantage at this position, not to
+the entire trajectory. Repeated actions receive no extra inverse-count
+weight in the training objective.
+
+\section{Two selection rounds and the dispersion gate}
+
+At a parent state \(s_t\), use the same action-mean standardization for
+the first-round advantage and its dispersion:
+\begin{equation}
+\sigma_t=\sigma_{q,s_t},\qquad
+A_{1,i}(s_t)=A_i^{\mathrm{state}}(s_t),\qquad
+M_t=\lceil0.2K_t\rceil.
+\end{equation}
+If \(\sigma_t=0\), the state creates no gated candidate. Otherwise, let
+\(\mathcal L_t(s_t)\) contain exactly \(M_t\) old trajectories with the
+smallest \(|A_{1,i}(s_t)|\). A cutoff tie is filled uniformly without
+replacement, so only the selected trajectories retain first-step
+eligibility. Candidate actions are deduplicated after this trajectory
+selection:
+\begin{equation}
+\mathcal C_t(s_t)=\{a_{i,t}:i\in\mathcal L_t(s_t)\}.
+\end{equation}
+
+For each candidate \(a\), set \(s_{t+1}=(s_t,a)\). Use \emph{all} old
+trajectories reaching this child state, including those not selected in
+the first round. Require at least five distinct observed next actions:
+\begin{equation}
+d=|\mathcal U(s_{t+1})|\geq5,\qquad
+\sigma_{t+1}=\sigma_{q,s_{t+1}}>0.
+\end{equation}
+The parent and child dispersions are both equally weighted standard
+deviations of distinct action-mean rewards. The dispersion gate is
+\begin{equation}
+G_{\Delta}(s_t,a)
+=\mathbf{1}\{\sigma_{t+1}\geq\omega\sigma_t\},
+\end{equation}
+where \(\omega\) is an unspecified tunable constant. When the gate
+passes, compute the signed second-step advantage
+\begin{equation}
+A_2(s_{t+1},u)
+=\frac{q_{s_{t+1}}(u)-\bar q_{s_{t+1}}}{\sigma_{t+1}}.
+\end{equation}
+Let \(\mathcal S(s_t,a)\) contain the \(m(d)=\lceil d/2\rceil\)
+distinct actions with largest \(|A_2(s_{t+1},u)|\). Fill cutoff ties
+uniformly at random. If any child condition or the dispersion gate
+fails, define \(\mathcal S(s_t,a)=\varnothing\).
+
+\section{Gates and two-step advantages}
+
+The action-level gate and trajectory-level first-step gate are
+\begin{align}
+G_t^{\mathrm{act}}(s_t,a)
+&=\mathbf{1}\{\sigma_t>0\}
+  \mathbf{1}\{a\in\mathcal C_t(s_t)\}
+  \mathbf{1}\{\mathcal S(s_t,a)\neq\varnothing\},\\
+B_{i,t}
+&=\mathbf{1}\{i\in\mathcal L_t(s_t)\}
+  G_t^{\mathrm{act}}(s_t,a_{i,t}).
+\end{align}
+Thus \(B_{i,t}=1\) implies that at least one successor action passed
+the second round. A same-\(a\) trajectory outside \(\mathcal L_t\)
+does not receive the first-step increment
+\begin{equation}
+\Delta A^{(1)}_{i,t}=\lambda B_{i,t},\qquad\lambda>0.
+\end{equation}
+
+For a passing child state and a non-overlapping second-step position,
+define \(I^{\mathcal S}_{i,t+1}
+=\mathbf{1}\{a_{i,t+1}\in\mathcal S(s_t,a_{i,t})\}\). The second-step
+coefficient is
+\begin{equation}
+\widetilde A_{i,t+1}
+=\bigl[1+(\beta-1)I^{\mathcal S}_{i,t+1}\bigr]
+ A_2(s_{t+1},a_{i,t+1}),\qquad\beta>1.
+\end{equation}
+Since \(A_i^{\mathrm{state}}(s_{t+1})=A_2(s_{t+1},a_{i,t+1})\)
+at this child state, unselected actions retain their ordinary
+action-mean advantage. Selected positive and negative actions both
+receive a larger absolute coefficient.
+
+If one position is the previous chain's second action and the next
+chain's selected first action, the confirmed overlap rule adds their
+two roles:
+\begin{equation}
+\widehat A_{i,j}^{\mathrm{overlap}}
+=A_i^{\mathrm{state}}(s_{i,j})+\lambda
+ +\beta I^{\mathcal S}_{i,j}
+ A_2(s_{i,j},a_{i,j}).
+\end{equation}
+When \(I^{\mathcal S}_{i,j}=1\), the action-level part is
+\((1+\beta)A_2\), because the two roles are added.
+
+\section{Per-position advantage and GRPO update}
+
+At each trajectory position, let
+\begin{equation}
+P_{i,j}
+=G_{j-1}^{\mathrm{act}}(s_{i,j-1},a_{i,j-1}),\qquad
+I^{\mathcal S}_{i,j}
+=\mathbf{1}\{a_{i,j}\in
+ \mathcal S(s_{i,j-1},a_{i,j-1})\}.
+\end{equation}
+Take a nonexistent previous gate at a trajectory boundary to be zero.
+Abbreviate \(A^{\mathrm{state}}_{i,j}
+=A_i^{\mathrm{state}}(s_{i,j})\) and
+\(A_{2,i,j}=A_2(s_{i,j},a_{i,j})\) when \(P_{i,j}=1\).
+The complete training advantage is
+\begin{equation}
+\widehat A_{i,j}=
+\begin{cases}
+A^{\mathrm{state}}_{i,j},
+ &P_{i,j}=0,\ B_{i,j}=0,\\
+A^{\mathrm{state}}_{i,j}+\lambda,
+ &P_{i,j}=0,\ B_{i,j}=1,\\
+\beta A_{2,i,j},
+ &P_{i,j}=1,\ B_{i,j}=0,\ I^{\mathcal S}_{i,j}=1,\\
+A^{\mathrm{state}}_{i,j},
+ &P_{i,j}=1,\ B_{i,j}=0,\ I^{\mathcal S}_{i,j}=0,\\
+\widehat A_{i,j}^{\mathrm{overlap}},
+ &P_{i,j}=1,\ B_{i,j}=1.
+\end{cases}
+\end{equation}
+
+For the known behavior policy \(\pi_{\mathrm{old}}\), define
+\begin{align}
+r_{i,j}(\theta)
+&=\frac{\pi_\theta(a_{i,j}\mid s_{i,j})}
+        {\pi_{\mathrm{old}}(a_{i,j}\mid s_{i,j})},\\
+\ell_{\mathrm{clip}}(r,A)
+&=\min\{rA,\operatorname{clip}(r,1-\epsilon,1+\epsilon)A\}.
+\end{align}
+Following the per-trajectory and per-position averaging of
+GRPO~\cite{shao2024deepseekmath}, maximize
+\begin{equation}
+\begin{aligned}
+J(\theta)
+=\mathbb E_{\{\tau_i\}\sim\pi_{\mathrm{old}}}\Bigg[
+ \frac{1}{N}\sum_{i=1}^{N}\frac{1}{T_i}
+ \sum_{j=1}^{T_i}\Big(
+ &\ell_{\mathrm{clip}}
+   (r_{i,j}(\theta),\widehat A_{i,j})\\[-2pt]
+ &-\kappa D^{\mathrm{KL}}_{i,j}(\theta)
+ \Big)\Bigg].
+\end{aligned}
+\end{equation}
+Equivalently, minimize \(-J(\theta)\). Old rewards, gates, and
+advantages are fixed during an update; gradients pass through the
+current-policy ratio and an optional KL term. A repeated action
+contributes one term per old trajectory occurrence, with no
+additional inverse-count correction.
+
+If KL regularization is enabled, the sampled-action estimator used
+in~\cite{shao2024deepseekmath} can be written
+\begin{equation}
+D^{\mathrm{KL}}_{i,j}(\theta)
+=\frac{\pi_{\mathrm{ref}}(a_{i,j}\mid s_{i,j})}
+       {\pi_\theta(a_{i,j}\mid s_{i,j})}
+ -\log\frac{\pi_{\mathrm{ref}}(a_{i,j}\mid s_{i,j})}
+            {\pi_\theta(a_{i,j}\mid s_{i,j})}-1.
+\end{equation}
+The clip width \(\epsilon\), optional KL weight \(\kappa\), and
+second-step amplifier \(\beta\) are distinct parameters. Their
+numerical values are not set here.
+
+\section{Calculation order}
+
+Collect old trajectories and terminal rewards from the known
+\(\pi_{\mathrm{old}}\). Group them by complete state and next action,
+then compute \(q_s(u)\), \(\sigma_{q,s}\), and
+\(A_i^{\mathrm{state}}(s)\). At each parent state select the lowest
+\(20\%\) of trajectories by \(|A_1|\). For each resulting action,
+use all old trajectories at its child state; check \(d\geq5\),
+nonzero parent and child dispersions, and the \(\Delta\) gate.
+Select \(m(d)\) next actions by \(|A_2|\), assign
+\(\widehat A_{i,j}\) using the five cases above, and update
+\(\theta\) with the clipped objective.
+
+This document specifies a theoretical procedure, not an experiment.
+The numerical values of \(\omega\), \(\lambda\), \(\beta\), and the
+mapping from an action to a token or full step remain unspecified.
+
+\bibliographystyle{plain}
+\bibliography{refs}
+
+\end{document}
