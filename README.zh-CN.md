@@ -31,4 +31,4 @@
 
 ## 欢迎交流与合作
 
-欢迎探讨信用分配假设、实验设计及可能的失败情形。如果你可以提供计算资源，或有兴趣复现、扩展实验，欢迎[通过 GitHub Issue 联系](https://github.com/ShuoZhang021022/local-reward-refinement-for-long-horizon-trajectories/issues)，共同讨论配置和资源需求。原有中英文项目构想保留在 [idea.md](idea.md) 与 [idea.zh-CN.md](idea.zh-CN.md)。
+欢迎探讨信用分配假设、实验设计及可能的失败情形。如果你可以提供计算资源，或有兴趣复现、扩展实验，欢迎[通过 GitHub Issue 联系](https://github.com/ShuoZhang021022/local-reward-refinement-for-long-horizon-trajectories/issues)或者给我发送邮件shuozhang2002@uchicago.edu，共同讨论配置和资源需求。原有中英文项目构想保留在 [idea.md](idea.md) 与 [idea.zh-CN.md](idea.zh-CN.md)。
