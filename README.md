@@ -31,4 +31,4 @@ These are first-run plans, not measured hardware guarantees. The Blocksworld and
 
 ## Discuss and collaborate
 
-Feedback on the credit-assignment assumptions, experimental design, and failure cases is welcome. If you can share compute resources or are interested in running or extending an experiment, please [open a GitHub issue](https://github.com/ShuoZhang021022/local-reward-refinement-for-long-horizon-trajectories/issues) to discuss the setup and required resources. The earlier bilingual project sketches are preserved as [idea.md](idea.md) and [idea.zh-CN.md](idea.zh-CN.md).
+Feedback on the credit-assignment assumptions, experimental design, and failure cases is welcome. If you can share compute resources or are interested in running or extending an experiment, please [open a GitHub issue](https://github.com/ShuoZhang021022/local-reward-refinement-for-long-horizon-trajectories/issues) or email me at shuozhang2002@uchicago.edu to discuss the setup and required resources. The earlier bilingual project sketches are preserved as [idea.md](idea.md) and [idea.zh-CN.md](idea.zh-CN.md).
