@@ -3,7 +3,8 @@
 **Status:** The research-critical settings below reflect the user's confirmed
 choices. This is a new interactive variant of HotpotQA distractor, not an
 official HotpotQA leaderboard protocol. Formal training requires the official
-labeled files and a CUDA training host; they are not present locally.
+labeled files and a single-node eight-A100 CUDA training host; a formal
+eight-GPU run has not been executed locally.
 
 ## Authority and task boundary
 
@@ -65,6 +66,15 @@ labeled files and a CUDA training host; they are not present locally.
   Both generations sample at temperature=1, top_p=1, top_k=0 during training.
   Evaluation is one greedy trajectory per question, and the highest validation
   answer F1 chooses the checkpoint; ties choose the earliest update.
+- **User-confirmed eight-GPU execution:** One training run jointly uses eight
+  A100 GPUs on one server. The total remains 256 sampled trajectories per
+  question, divided equally into 32 per GPU. Each rank receives a fixed
+  deterministic seed derived from the run seed and rank, using
+  `training_seed * 1009 + rank`; both arms use the same mapping. The method
+  computes anchor statistics and gates from the full 256-trajectory batch,
+  then averages the eight equal-sized local policy gradients before each
+  shared AdamW update. This changes only the rollout RNG partition and
+  numerical reduction order relative to the former single-GPU path.
 - **Previously confirmed methods:** Both arms group visits by the same anchor,
   compute action mean terminal reward and equally weighted across-action
   standard deviation, and use the same generated-token objective. The
@@ -136,6 +146,11 @@ from summed counts rather than averaging per-update percentages.
 Place the official labeled train JSON and distractor dev JSON at the paths in
 `experiment.json`, or edit those paths before `prepare`. `prepare` locks file
 hashes, question IDs, model and tokenizer revision, effective config, and
-source hashes. Run the three seeds for both arms against the same plan on a
-CUDA host. Model and service failures abort the run with failure recorded.
-No full local run or research conclusion follows from unit tests alone.
+source hashes. Run the three seeds for both arms against the same plan using
+`torchrun --standalone --nnodes=1 --nproc-per-node=8` on the same A100 node.
+Each rank has a full model replica. Validation and final testing shard
+questions without changing the greedy one-attempt rule; their outputs are
+merged in original question order. Rank-0 checkpoints preserve the synchronized
+weights and optimizer state plus all ranks' RNG states. Model and service
+failures abort the run. No full eight-GPU run or research conclusion follows
+from CPU unit tests alone.

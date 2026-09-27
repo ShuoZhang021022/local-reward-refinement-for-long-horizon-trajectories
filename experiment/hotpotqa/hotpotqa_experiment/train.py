@@ -6,19 +6,14 @@ import argparse
 from collections import Counter
 from datetime import datetime, timezone
 import hashlib
-import importlib.metadata
 import json
 from pathlib import Path
-import platform
-import random
 import subprocess
 import traceback
+import os
 from typing import Any
 
-from game24_experiment.checkpoints import file_sha256, save_training_state
-from game24_experiment.io import append_jsonl, write_json, write_jsonl_gzip
-from game24_experiment.method import compute_advantages
-from game24_experiment.train import _attach_old_and_reference_logprobs, _update, _visits
+from game24_experiment.io import write_json
 
 from .config import ExperimentConfig
 from .data import load_train_and_dev, split_train_validation, validate_official_counts
@@ -268,240 +263,11 @@ def _diagnostic_metrics(trajectories: list[Any], batch: Any, *, arm: str) -> dic
     }
 
 
-def _evaluate(runner: Any, questions: dict[str, Any], ids: list[str], *,
-              label: str, output_path: Path) -> dict:
-    if not ids:
-        raise ValueError("Evaluation split cannot be empty")
-    all_trajectories = []
-    for start in range(0, len(ids), runner.generation_batch_size):
-        chunk_ids = ids[start:start + runner.generation_batch_size]
-        indexed = [(start + index, questions[question_id])
-                   for index, question_id in enumerate(chunk_ids)]
-        all_trajectories.extend(runner.rollout(indexed, repetitions=1,
-                                               label=label, do_sample=False))
-    write_jsonl_gzip(output_path, (item.record() for item in all_trajectories))
-    known_coverages = [item.support_document_coverage for item in all_trajectories
-                       if item.support_document_coverage is not None]
-    return {
-        "question_count": len(all_trajectories),
-        "answer_em": sum(item.exact_match for item in all_trajectories)
-                     / len(all_trajectories),
-        "answer_f1": float(sum((item.reward for item in all_trajectories), 0)
-                           / len(all_trajectories)),
-        "mean_read_count": sum(len(item.session.read_order)
-                               for item in all_trajectories) / len(all_trajectories),
-        "gold_support_document_coverage_mean": (
-            float(sum(known_coverages, 0) / len(known_coverages))
-            if known_coverages else None),
-        "full_gold_support_document_coverage_fraction": (
-            sum(value == 1 for value in known_coverages) / len(known_coverages)
-            if known_coverages else None),
-        "invalid_trajectories": sum(item.session.failed for item in all_trajectories),
-        "model_calls": sum(item.record()["model_calls"] for item in all_trajectories),
-        "generated_tokens": sum(item.record()["generated_tokens"]
-                                for item in all_trajectories),
-    }
-
-
 def run(plan_path: Path, output: Path, *, arm: str, seed: int) -> None:
-    import torch
-    from peft import LoraConfig, get_peft_model
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    from .modeling import PolicyRunner
+    """Run one arm and seed synchronously on one eight-A100 node."""
+    from .distributed import run as distributed_run
 
-    plan_bytes = plan_path.read_bytes()
-    plan = json.loads(plan_bytes)
-    config = _config_from_plan(plan)
-    if arm not in config.arms or seed not in config.training_seeds:
-        raise ValueError("Arm or seed is not in the locked plan")
-    if plan["source_hashes"] != _source_hashes():
-        raise ValueError("Source files changed after the plan was locked")
-    if output.exists() and any(output.iterdir()):
-        raise FileExistsError(f"Run directory is not empty: {output}")
-    train, dev, data_hashes = load_train_and_dev(Path(config.train_json),
-                                                 Path(config.dev_json))
-    validate_official_counts(train, dev)
-    if data_hashes != plan["data_hashes"]:
-        raise ValueError("Dataset files changed after prepare")
-    split = split_train_validation(train, dev, seed=config.split_seed,
-                                   validation_fraction=config.validation_fraction)
-    if split != plan["split"]:
-        raise ValueError("Dataset split changed after prepare")
-    if not torch.cuda.is_available():
-        raise RuntimeError("Formal training requires a CUDA GPU; no run started")
-    questions = {item.question_id: item for item in train + dev}
-    output.mkdir(parents=True, exist_ok=True)
-    (output / "plan.json").write_bytes(plan_bytes)
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    device = torch.device("cuda:0")
-    manifest = {
-        "schema_version": 1, "status": "running", "started_utc": _utc_now(),
-        "arm": arm, "seed": seed,
-        "plan_sha256": hashlib.sha256(plan_bytes).hexdigest(),
-        "plan": plan, "git": _git_state(), "source_hashes": _source_hashes(),
-        "versions": {name: importlib.metadata.version(name) for name in
-                     ("torch", "transformers", "peft", "huggingface_hub")},
-        "runtime": {"python": platform.python_version(),
-                    "platform": platform.platform(), "cuda": torch.version.cuda,
-                    "cudnn": torch.backends.cudnn.version(),
-                    "deterministic_algorithms": torch.are_deterministic_algorithms_enabled()},
-        "gpu": torch.cuda.get_device_name(0),
-        "gpu_total_memory": torch.cuda.get_device_properties(0).total_memory,
-        "audit_checkpoint_policy": "initial_and_every_update",
-    }
-    write_json(output / "manifest.json", manifest)
-
-    tokenizer = AutoTokenizer.from_pretrained(config.model_id,
-                                               revision=plan["tokenizer_revision"])
-    base = AutoModelForCausalLM.from_pretrained(
-        config.model_id, revision=config.model_revision, dtype=torch.bfloat16,
-    ).to(device)
-    lora = LoraConfig(r=config.lora_rank, lora_alpha=config.lora_alpha,
-                      lora_dropout=config.lora_dropout,
-                      target_modules=list(config.lora_target_modules), bias="none",
-                      task_type="CAUSAL_LM")
-    model = get_peft_model(base, lora)
-    model.config.use_cache = True
-    model.enable_input_require_grads()
-    trainable = [(name, parameter) for name, parameter in model.named_parameters()
-                 if parameter.requires_grad]
-    if not trainable:
-        raise RuntimeError("No trainable LoRA parameters")
-    optimizer = torch.optim.AdamW([parameter for _, parameter in trainable],
-                                  lr=config.learning_rate,
-                                  weight_decay=config.weight_decay)
-    runner = PolicyRunner(model, tokenizer,
-                          max_new_tokens=config.selection_max_new_tokens,
-                          generation_batch_size=config.generation_batch_size,
-                          device=device)
-    if config.answer_max_new_tokens != runner.max_new_tokens:
-        raise ValueError("Answer generation limit is not implemented separately")
-    if runner.special_tokens != plan["special_tokens"]:
-        raise ValueError("Checkpoint special tokens differ from the locked plan")
-    manifest["trainable_parameters"] = {
-        "count": sum(parameter.numel() for _, parameter in trainable),
-        "names": [name for name, _ in trainable]}
-    manifest["generation_config_from_checkpoint"] = model.generation_config.to_dict()
-    manifest["generation_overrides"] = {
-        "training_selection_and_answer": runner.generation_options(do_sample=True),
-        "evaluation_selection_and_answer": runner.generation_options(do_sample=False),
-    }
-    manifest["optimizer_effective_parameter_groups"] = [
-        {key: value for key, value in group.items() if key != "params"}
-        for group in optimizer.param_groups]
-    write_json(output / "manifest.json", manifest)
-
-    best_f1 = -1.0
-    best_update = -1
-    best_weights: dict[str, torch.Tensor] = {}
-
-    def validation(update: int) -> None:
-        nonlocal best_f1, best_update, best_weights
-        metrics = _evaluate(runner, questions, split["validation_ids"],
-                            label=f"val:u{update}",
-                            output_path=output / f"validation_{update:05d}.jsonl.gz")
-        append_jsonl(output / "validations.jsonl",
-                     {**metrics, "update": update, "utc": _utc_now()})
-        if metrics["answer_f1"] > best_f1:
-            best_f1 = metrics["answer_f1"]
-            best_update = update
-            best_weights = {name: parameter.detach().cpu().clone()
-                            for name, parameter in trainable}
-            model.save_pretrained(output / "best_adapter")
-            write_json(output / "best_selection.json", {
-                "update": update, "validation_answer_f1": best_f1,
-                "rule": config.checkpoint_selection,
-                "audit_checkpoint": f"checkpoints/state_{update:05d}.pt",
-            })
-
-    validation(0)
-
-    def checkpoint(update: int) -> dict:
-        result = save_training_state(
-            output / "checkpoints" / f"state_{update:05d}.pt", model, optimizer,
-            metadata={"update": update, "arm": arm, "seed": seed,
-                      "plan_sha256": manifest["plan_sha256"],
-                      "best_update": best_update, "best_validation_answer_f1": best_f1},
-        )
-        result["file"] = f"checkpoints/{result['file']}"
-        append_jsonl(output / "checkpoints.jsonl", result)
-        return result
-
-    checkpoint(0)
-    ordered = list(split["train_ids"])
-    random.Random(seed).shuffle(ordered)
-    write_json(output / "train_order.json", {"question_ids": ordered, "seed": seed})
-    update_index = 0
-    expected_updates = config.epochs * (
-        (len(ordered) + config.questions_per_update - 1) // config.questions_per_update)
-    for epoch in range(config.epochs):
-        if epoch:
-            random.Random(seed + epoch).shuffle(ordered)
-        for start in range(0, len(ordered), config.questions_per_update):
-            update_index += 1
-            question_ids = ordered[start:start + config.questions_per_update]
-            selected = [(index, questions[question_id])
-                        for index, question_id in enumerate(question_ids)]
-            trajectories = runner.rollout(
-                selected, repetitions=config.trajectories_per_question,
-                label=f"train:{arm}:{seed}:u{update_index}", do_sample=True)
-            _attach_old_and_reference_logprobs(runner, trajectories,
-                                               config.scoring_batch_size)
-            batch = compute_advantages(
-                _visits(trajectories), omega=config.omega,
-                lambda_bonus=config.lambda_bonus, beta=config.beta,
-                seed=seed + update_index)
-            rollout_path = output / f"rollouts_{update_index:05d}.jsonl.gz"
-            stats_path = output / f"stats_{update_index:05d}.json"
-            token_path = output / f"tokens_{update_index:05d}.jsonl.gz"
-            write_jsonl_gzip(rollout_path, (
-                _trajectory_record_with_gate(item, batch, arm=arm)
-                for item in trajectories))
-            write_json(stats_path, _stats_record(trajectories, batch, arm=arm))
-            metrics = _update(model, optimizer, trajectories, batch,
-                              arm=arm, config=config, pad_id=runner.pad_id,
-                              device=device,
-                              microbatch_size=config.gradient_microbatch_size,
-                              token_log_path=token_path)
-            metrics.update(_diagnostic_metrics(trajectories, batch, arm=arm))
-            metrics["update_artifacts"] = {
-                artifact.name: {"bytes": artifact.stat().st_size,
-                                "sha256": file_sha256(artifact)}
-                for artifact in (rollout_path, stats_path, token_path)}
-            metrics.update({"update": update_index, "epoch": epoch,
-                            "question_ids": question_ids, "utc": _utc_now(),
-                            "old_policy_checkpoint":
-                                f"checkpoints/state_{update_index - 1:05d}.pt",
-                            "new_policy_checkpoint":
-                                f"checkpoints/state_{update_index:05d}.pt"})
-            if (update_index % config.validation_every_updates == 0 or
-                    start + config.questions_per_update >= len(ordered)):
-                validation(update_index)
-            checkpoint_record = checkpoint(update_index)
-            metrics["new_checkpoint_sha256"] = checkpoint_record["sha256"]
-            append_jsonl(output / "updates.jsonl", metrics)
-            print(f"update={update_index}/{expected_updates} "
-                  f"answer_f1={metrics['answer_f1_mean']:.4f} "
-                  f"gates={metrics['passed_gate_count']}/{metrics['candidate_gate_count']}",
-                  flush=True)
-    model.save_pretrained(output / "final_adapter")
-    with torch.no_grad():
-        for name, parameter in trainable:
-            parameter.copy_(best_weights[name].to(device))
-    test_metrics = _evaluate(runner, questions, split["test_ids"],
-                             label="test:selected",
-                             output_path=output / "test.jsonl.gz")
-    write_json(output / "test_metrics.json", {
-        **test_metrics, "selected_update": best_update,
-        "selected_validation_answer_f1": best_f1,
-        "selected_checkpoint": f"checkpoints/state_{best_update:05d}.pt",
-    })
-    manifest.update({"status": "complete", "finished_utc": _utc_now(),
-                     "selected_update": best_update,
-                     "completed_updates": update_index})
-    write_json(output / "manifest.json", manifest)
+    distributed_run(plan_path, output, arm=arm, seed=seed)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -510,7 +276,7 @@ def main(argv: list[str] | None = None) -> None:
     prep = sub.add_parser("prepare", help="Lock dataset, model, config, and source")
     prep.add_argument("--config", type=Path, required=True)
     prep.add_argument("--output", type=Path, required=True)
-    job = sub.add_parser("run", help="Run one arm and seed on CUDA")
+    job = sub.add_parser("run", help="Run one arm and seed on eight local A100 GPUs")
     job.add_argument("--plan", type=Path, required=True)
     job.add_argument("--output", type=Path, required=True)
     job.add_argument("--arm", choices=("baseline", "two_step"), required=True)
@@ -524,7 +290,8 @@ def main(argv: list[str] | None = None) -> None:
         try:
             run(args.plan, args.output, arm=args.arm, seed=args.seed)
         except BaseException:
-            if not manifest_existed and manifest_path.is_file():
+            if (not manifest_existed and manifest_path.is_file() and
+                    os.environ.get("RANK", "0") == "0"):
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
                 manifest.update({"status": "failed", "failed_utc": _utc_now(),
                                  "failure_traceback": traceback.format_exc()})

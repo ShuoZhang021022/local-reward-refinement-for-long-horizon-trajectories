@@ -15,16 +15,20 @@ and [single-step baseline](action_mean_grpo_baseline.md). The
 game24_experiment/ Python package bundles the shared runtime imported by
 this experiment; the Game24 task itself is not part of the HotpotQA evaluation.
 
-Run commands from **this directory**. Install a CUDA-enabled PyTorch build
-appropriate for your GPU and the packages in [requirements.txt](requirements.txt).
+Run commands from **this directory** on one Linux server with eight A100 GPUs.
+Install a CUDA-enabled PyTorch build with NCCL and the packages in
+[requirements.txt](requirements.txt).
 Place the official labeled train and distractor-dev JSON files under data/
 as described in [data/README.md](data/README.md). Then run:
 
     python -m unittest discover -s tests -v
     python -m hotpotqa_experiment.train prepare --config hotpotqa_experiment/experiment.json --output runs/hotpotqa_plan
 
-Use the same prepared plan for both arms and all three seeds; the experiment
-guide gives the run and summary commands. Dataset files and run artifacts are
+Use the same prepared plan for both arms and all three seeds. Each run jointly
+uses all eight GPUs, with 32 of the 256 trajectories per question on each GPU;
+anchor statistics and gates use the full 256 before synchronized updates.
+The experiment guide gives the `torchrun` and summary commands. Recreate any
+older plan because the source hashes have changed. Dataset files and run artifacts are
 excluded from this upload. No pretrained-model training run, final comparison,
 or official HotpotQA joint score is included. The local tests use synthetic
 questions and do not establish an empirical result.
