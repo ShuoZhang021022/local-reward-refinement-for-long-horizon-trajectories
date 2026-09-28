@@ -68,7 +68,7 @@ r_{i,j,k}(\theta)=
 \frac{\pi_\theta(y_{i,j,k}\mid h_{i,j,k})}
 {\pi_{\mathrm{old}}(y_{i,j,k}\mid h_{i,j,k})},\qquad
 \ell_{\mathrm{clip}}(r,A)=
-\min\!\left\{rA,\operatorname{clip}(r,1-\epsilon,1+\epsilon)A\right\}.
+\min\!\left\{rA,\mathrm{clip}(r,1-\epsilon,1+\epsilon)A\right\}.
 ```
 
 Only model-generated tokens contribute to $`L_{i,j}`$ and its sum. As in the two-step method, per-token KL is enabled, with the same reference policy $`\pi_{\mathrm{ref}}`$ and coefficient $`\kappa>0`$. Use the per-token KL estimator from [original GRPO](https://arxiv.org/html/2402.03300):

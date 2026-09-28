@@ -9,9 +9,9 @@ Starting from state $`s_t`$, the first action $`a`$ may have an average terminal
 The law of total variance motivates this design. Let $`h=(s_t,a)`$ and $`u=a'`$. Then
 
 ```math
-\operatorname{Var}(R\mid h)
-=\operatorname{Var}_{u\mid h}\!\bigl(\mathbb E[R\mid h,u]\bigr)
-+\mathbb E_{u\mid h}\!\bigl[\operatorname{Var}(R\mid h,u)\bigr].
+\mathrm{Var}(R\mid h)
+=\mathrm{Var}_{u\mid h}\!\bigl(\mathbb E[R\mid h,u]\bigr)
++\mathbb E_{u\mid h}\!\bigl[\mathrm{Var}(R\mid h,u)\bigr].
 ```
 
 The first term describes variation among the average terminal outcomes of different $`a'`$; the second describes outcome variation within the same $`a'`$. The current method first averages terminal rewards by action at both parent and child states, then uses the equal-weight standard deviation of distinct action means for the $`\Delta`$ gate. It neither estimates nor gates the second term separately, and it does not add a branch-estimate reliability gate. Because the method weights distinct actions equally while the variance identity weights them by their action probabilities, these are not exactly the same variance.
@@ -299,7 +299,7 @@ r_{i,j,k}(\theta)=
 {\pi_{\mathrm{old}}(y_{i,j,k}\mid h_{i,j,k})},
 \qquad
 \ell_{\mathrm{clip}}(r,A)=
-\min\{rA,\operatorname{clip}(r,1-\epsilon,1+\epsilon)A\}.
+\min\{rA,\mathrm{clip}(r,1-\epsilon,1+\epsilon)A\}.
 ```
 
 For each step of each trajectory, first average the clipped and KL terms over the $`L_{i,j}`$ tokens actually generated at that step, then average over steps and trajectories as specified. Per-token KL is enabled. Let $`D^{\mathrm{KL}}_{i,j,k}(\theta)`$ be the token KL estimator defined below, with coefficient $`\kappa>0`$. The objective is
