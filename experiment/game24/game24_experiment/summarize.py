@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from dataclasses import asdict
 import gzip
 import json
 from pathlib import Path
 from random import Random
 
 from .checkpoints import file_sha256
+from .data import load_puzzles
+from .env import Game24
 from .io import write_json
 from .train import _config_from_plan
 
@@ -27,7 +30,9 @@ def _count(value: object, label: str) -> int:
     return value
 
 
-def _read_evaluation(path: Path, expected_indices: list[int]) -> tuple[dict[int, int], dict]:
+def _read_evaluation(path: Path, expected_indices: list[int],
+                     expected_numbers: dict[int, tuple[int, int, int, int]],
+                     *, eos_ids: set[int], max_new_tokens: int) -> tuple[dict[int, int], dict]:
     if not path.is_file():
         raise ValueError(f"Missing evaluation trace: {path}")
     outcomes: dict[int, int] = {}
@@ -49,9 +54,32 @@ def _read_evaluation(path: Path, expected_indices: list[int]) -> tuple[dict[int,
                     or generated_tokens != sum(len(step["completion_ids"]) for step in decisions)
                     or generated_tokens < model_calls):
                 raise ValueError(f"Inconsistent evaluation trajectory at puzzle {index}: {path}")
+            if index not in expected_numbers or row.get("numbers") != list(expected_numbers[index]):
+                raise ValueError(f"Evaluation puzzle numbers disagree with source at {index}: {path}")
+            game = Game24(expected_numbers[index])
+            for decision in decisions:
+                ids = decision["completion_ids"]
+                ended = decision["ended_by_eos"]
+                if (not isinstance(ids, list) or not ids or len(ids) > max_new_tokens
+                        or any(type(token) is not int for token in ids)
+                        or type(ended) is not bool
+                        or decision["generated_token_mask"] != [1] * len(ids)
+                        or (ended and (ids[-1] not in eos_ids
+                                       or any(token in eos_ids for token in ids[:-1])))
+                        or (not ended and (len(ids) != max_new_tokens
+                                           or any(token in eos_ids for token in ids)))
+                        or decision["termination_token_id"] != (ids[-1] if ended else None)
+                        or game.terminal):
+                    raise ValueError(f"Invalid evaluation completion at puzzle {index}: {path}")
+                recorded = decision["transition"]
+                raw = recorded["raw_output"]
+                actual = game.step(raw) if ended else game.fail(raw, "generation_limit")
+                if recorded != json.loads(json.dumps(asdict(actual))):
+                    raise ValueError(f"Evaluation transition disagrees with Game24 at {index}: {path}")
             termination = row["termination"]
-            if (reward == 1) != (termination == "success"):
-                raise ValueError(f"Reward disagrees with termination at puzzle {index}: {path}")
+            if (reward != game.reward or termination != game.termination
+                    or row["final_expression"] != decisions[-1]["transition"]["expression"]):
+                raise ValueError(f"Evaluation result disagrees with Game24 at puzzle {index}: {path}")
             outcomes[index] = reward
             calls += model_calls
             tokens += generated_tokens
@@ -104,6 +132,14 @@ def _load_run(path: Path) -> tuple[dict, dict[int, int], dict]:
     if plan != manifest["plan"]:
         raise ValueError(f"Manifest plan differs from locked plan: {path}")
     config = _config_from_plan(plan)
+    dataset_path = Path(config.dataset_csv)
+    if not dataset_path.is_absolute():
+        dataset_path = Path(__file__).resolve().parents[1] / dataset_path
+    puzzles, data_hash = load_puzzles(dataset_path)
+    if data_hash != plan["split"]["source_sha256"]:
+        raise ValueError(f"Evaluation source data disagrees with locked plan: {path}")
+    expected_numbers = {index: puzzle.numbers for index, puzzle in enumerate(puzzles)}
+    eos_ids = set(plan["special_tokens"]["eos_token_ids"])
     if manifest["arm"] not in config.arms or manifest["seed"] not in config.training_seeds:
         raise ValueError(f"Unexpected arm or seed: {path}")
     updates_per_epoch = (
@@ -198,6 +234,7 @@ def _load_run(path: Path) -> tuple[dict, dict[int, int], dict]:
     for update, row in zip(expected_validations, validations):
         _, actual = _read_evaluation(
             path / f"validation_{update:04d}.jsonl.gz", plan["split"]["validation"],
+            expected_numbers, eos_ids=eos_ids, max_new_tokens=config.max_new_tokens,
         )
         _check_metrics(row, actual, path)
         counts["validation_generation_decisions"] += actual["model_calls"]
@@ -210,13 +247,28 @@ def _load_run(path: Path) -> tuple[dict, dict[int, int], dict]:
             or selection.get("audit_checkpoint") != checkpoints[best_update]["file"]
             or manifest.get("selected_update") != best_update):
         raise ValueError(f"Best checkpoint does not follow validation rule: {path}")
+    adapter_artifacts = manifest.get("adapter_artifacts")
+    if not isinstance(adapter_artifacts, dict) or set(adapter_artifacts) != {
+        "best_adapter", "final_adapter",
+    }:
+        raise ValueError(f"Missing adapter artifact checksums: {path}")
     for adapter in ("best_adapter", "final_adapter"):
-        if not (path / adapter / "adapter_config.json").is_file() or not (
-            path / adapter / "adapter_model.safetensors"
-        ).is_file():
-            raise ValueError(f"Missing saved adapter {adapter}: {path}")
+        expected_files = adapter_artifacts[adapter]
+        if not isinstance(expected_files, dict) or set(expected_files) != {
+            "adapter_config.json", "adapter_model.safetensors",
+        }:
+            raise ValueError(f"Missing adapter artifact checksums for {adapter}: {path}")
+        for filename, recorded in expected_files.items():
+            artifact = path / adapter / filename
+            if (not isinstance(recorded, dict) or not artifact.is_file()
+                    or artifact.stat().st_size != recorded.get("bytes")
+                    or file_sha256(artifact) != recorded.get("sha256")):
+                raise ValueError(f"Missing or altered saved adapter {adapter}/{filename}: {path}")
 
-    outcomes, actual_test = _read_evaluation(path / "test.jsonl.gz", plan["split"]["test"])
+    outcomes, actual_test = _read_evaluation(
+        path / "test.jsonl.gz", plan["split"]["test"], expected_numbers,
+        eos_ids=eos_ids, max_new_tokens=config.max_new_tokens,
+    )
     if sorted(outcomes) != list(range(900, 1000)):
         raise ValueError(f"Test set mismatch: {path}")
     test_metrics = json.loads((path / "test_metrics.json").read_text(encoding="utf-8"))

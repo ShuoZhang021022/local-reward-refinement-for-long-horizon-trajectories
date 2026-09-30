@@ -13,13 +13,14 @@ All arithmetic uses exact rational numbers. Three legal operations must leave 24
 | Choice | Value | Reason for first run |
 | --- | --- | --- |
 | Model | `Qwen/Qwen3-4B-Instruct-2507`, exact revision locked at `prepare` | Non-thinking 4B model with trainable weights; fits the action-only protocol. [Model card](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507) |
-| Trainable scope | LoRA on `q/k/v/o/gate/up/down_proj`, rank 16, alpha 32, dropout 0 | Makes one A100 80GB plausible while keeping both arms' update scope identical. No extra dropout regularizer. |
+| Trainable scope | LoRA on `q/k/v/o/gate/up/down_proj`, rank 16, alpha 32, dropout 0 | Keeps the same update scope in both arms; one independent run is assigned to each A100 40GB. No extra dropout regularizer. |
 | Reference | Frozen initial base model with LoRA adapter disabled | Same reference for both arms; no second 4B model copy in GPU memory. [PEFT API](https://huggingface.co/docs/peft/package_reference/peft_model) |
 | Gate/advantage | `ω=1`, `λ=0.5`, `β=1.5` | Requires child action-mean dispersion at least as large as parent; modest positive entry bonus and second-action scaling. These are fixed choices, not tuned claims. |
 | Objective | Per-token `ε=0.2`, `κ=0.01`; exact step/token/trajectory reduction in the method documents | KL is enabled in both arms, with the same reference and coefficient. |
 | Optimizer | AdamW, learning rate `1e-5`, weight decay 0, no gradient clipping, one update per on-policy batch | Avoids extra regularization or multiple passes over stale rollouts. |
 | Training budget | One pass through 1136 training puzzles, 8 puzzles/update, 256 trajectories/puzzle, 3 paired seeds | Repeated rollouts per puzzle give the five-observed-action gate a chance to fire; 142 updates per seed and arm. |
 | Generation | Sample from raw policy: temperature 1, top-p 1, top-k 0; max 32 new tokens | Old-policy token logprobs match the behavior distribution without sampling truncation. |
+| Per-GPU batches | Generation 8, scoring 8, gradient microbatch 4 | Conservative 40GB starting values. These change execution chunking, while each update still uses 8 puzzles and 256 trajectories per puzzle. Peak memory remains unmeasured. |
 | Evaluation | Greedy, one complete attempt per puzzle; validate initially, every 10 updates, and at end; choose highest validation accuracy, earliest update on ties | Stable checkpoint selection without looking at test. Test the selected checkpoint once at the end. |
 | Split | Official zero-based indices `[900,1000)` held for test; each other original-rank block of 100 contributes 10 validation puzzles, final block of 62 contributes 6 | Fixed 1136/126/100 train/validation/test split. SHA256 ordering and seed `20260926` determine IDs; the plan saves the full lists. |
 
@@ -34,27 +35,26 @@ mkdir -p data
 curl -L https://raw.githubusercontent.com/princeton-nlp/tree-of-thought-llm/733b009f627f8e5c81c3e5461391d3aa3e0dd18f/src/tot/data/24/24.csv -o data/24.csv
 ```
 
-Install a CUDA-enabled PyTorch suitable for the GPU, then install `game24_experiment/requirements.txt`. Run the unit tests before the experiment:
+Install a CUDA-enabled PyTorch suitable for the A100, then install `game24_experiment/requirements.txt`. Run the unit tests before the experiment. The launcher starts all six planned arm/seed runs concurrently on six distinct physical GPUs, one model and one optimizer per GPU. It uses `nvidia-smi` to verify the A100 model, at least 38 GiB reported memory, and distinct GPU UUIDs. If `CUDA_VISIBLE_DEVICES` is set, it must list six GPU indices or UUIDs in the desired order; otherwise the launcher uses GPU indices `0,1,2,3,4,5`. It divides the available CPU thread pool across the six processes for unset `OMP_NUM_THREADS` and `MKL_NUM_THREADS`; explicit environment values take precedence. Training batches score their generated tokens together and transfer token audit fields to the CPU once per microbatch. These execution changes preserve the fixed sampling and update settings, but A100 utilization and memory headroom still require measurement on the rented host.
 
 ```bash
 python -m unittest discover -s tests -v
-python -m game24_experiment.train prepare --config game24_experiment/experiment.json --output runs/game24-plan
-python -m game24_experiment.train run --plan runs/game24-plan/plan.json --output runs/baseline-20260926 --arm baseline --seed 20260926
-python -m game24_experiment.train run --plan runs/game24-plan/plan.json --output runs/two-step-20260926 --arm two_step --seed 20260926
+python -m game24_experiment.train prepare --config game24_experiment/experiment.json --output runs/game24-plan-6xa100
+python -m game24_experiment.launch_6gpu --plan runs/game24-plan-6xa100/plan.json --output-root runs/game24-6xa100
 ```
 
-Repeat the two `run` commands for seeds `20260927` and `20260928`, using separate output directories. `prepare` requires network access to resolve the model's immutable revision and read its generation configuration. It does not load the 4B weights or sample trajectories. Model and tokenizer use the same locked repository revision. The same source CSV and root working directory must be used for every run. Plans use schema version 2; older plans must be recreated. A run refuses to overwrite a nonempty output directory and preserves its existing manifest. If an infrastructure failure interrupts a run, it is incomplete and must be rerun under a new directory; there is no automatic retry or resume.
+The launcher writes one run directory and one console log per arm/seed combination under the output root. Each child sees exactly one GPU as `cuda:0`, and its manifest records the assigned `CUDA_VISIBLE_DEVICES` value, CPU thread settings, and detected GPU memory. The initial validation and each update record PyTorch peak allocated/reserved CUDA bytes for memory review. The launcher requires an empty output root, waits for all six runs, and reports any failures without retrying. `prepare` requires network access to resolve the model's immutable revision and read its generation configuration. It does not load the 4B weights or sample trajectories. Model and tokenizer use the same locked repository revision. The same source CSV and root working directory must be used for every run. The changed configuration and source hashes require a **new plan**; the existing `runs/game24-plan-v*` files cannot be reused. If an infrastructure failure interrupts a run, it is incomplete and must be rerun under a new directory; there is no automatic retry or resume. Changing execution batch sizes can change the precise random samples drawn from a seed, although it does not alter the sampling distribution or update budget.
 
 After all six runs finish, summarize the paired test outcomes:
 
 ```bash
-python -m game24_experiment.summarize --output runs/game24-summary.json \
-  runs/baseline-20260926 runs/two-step-20260926 \
-  runs/baseline-20260927 runs/two-step-20260927 \
-  runs/baseline-20260928 runs/two-step-20260928
+python -m game24_experiment.summarize --output runs/game24-6xa100-summary.json \
+  runs/game24-6xa100/baseline-20260926 runs/game24-6xa100/two-step-20260926 \
+  runs/game24-6xa100/baseline-20260927 runs/game24-6xa100/two-step-20260927 \
+  runs/game24-6xa100/baseline-20260928 runs/game24-6xa100/two-step-20260928
 ```
 
-The summary requires all arm/seed combinations in the locked plan (six runs for this configuration), matching library versions, and an unaltered copy of the same plan. It checks the training order, every update record, the SHA256 and byte size of each rollout/token/state-statistics artifact and audit checkpoint, the scheduled validation traces and metrics, the earliest-best selection, saved adapters, and the selected test trace and metrics. Missing even a complete seed pair is rejected. This verifies recorded artifacts and their internal consistency; it does not independently prove that the model produced their contents. It reports per-seed paired differences and a puzzle-bootstrap interval. That interval conditions on the three recorded training seeds; it does not claim to quantify uncertainty over all possible training seeds.
+The summary requires all arm/seed combinations in the locked plan (six runs for this configuration), matching library versions, and an unaltered copy of the same plan. It checks the training order, every update record, the SHA256 and byte size of each rollout/token/state-statistics artifact, audit checkpoint, and saved adapter, the scheduled validation traces and metrics, the earliest-best selection, and the selected test trace and metrics. It also checks evaluation puzzle numbers against the trusted CSV and replays every recorded validation/test action through the exact Game24 environment before accepting rewards and success counts. Missing even a complete seed pair is rejected. This verifies recorded artifacts and their internal consistency; it does not independently prove that the model produced their contents or that raw text was decoded faithfully from token IDs. It reports per-seed paired differences and a puzzle-bootstrap interval. That interval conditions on the three recorded training seeds; it does not claim to quantify uncertainty over all possible training seeds.
 
 The report also includes per-run and per-arm actual generation-decision calls, generated tokens, invalid rates, candidate/passed gate actions, and eligible/applied λ and β visits. A generation-decision call is one model response for one Game24 state, including responses batched together; reference/current scoring forwards are not included. Gate fractions use candidate actions as the denominator. Applied λ/β fractions use all training decisions as the denominator. Baseline gate counts are diagnostics on its own trajectories; its applied λ/β counts remain zero. Summarization reads and hashes every audit checkpoint, so allow time for the full six-run audit.
 
@@ -87,4 +87,4 @@ The `*_eligible_visit_count` fields describe the two-step calculation on the bat
 
 This retains 143 audit snapshots per run for the current configuration. Full optimizer states increase disk use substantially; `manifest.json.estimated_audit_checkpoint_bytes` estimates the run's snapshot storage after the first update, excluding rollouts and token logs. Preserve sufficient disk space on the external host. These audit snapshots do not introduce automatic continuation of failed experiments.
 
-The current Windows workspace has CPU PyTorch. Tests cover both checkpoint EOS IDs, strict source checks, complete-run aggregation and tamper rejection, per-state counts, checkpoint restoration, the installed Transformers chat-template return type, and a small randomly initialized Qwen3 architecture with real PEFT generation and gradient updates. These tests download no model weights and make no Game24 performance claim. Actual pretrained 4B generation, A100 memory/speed, and learning remain unverified until the external host is available. No experiment result is claimed by this repository yet.
+The current Windows workspace has CPU PyTorch. Tests cover both checkpoint EOS IDs, strict source checks, complete-run aggregation and tamper rejection, exact evaluation replay, per-state counts, checkpoint restoration, the installed Transformers chat-template return type, and a small randomly initialized Qwen3 architecture with real PEFT generation, generation/rescoring log-probability agreement, and gradient updates. These tests download no model weights and make no Game24 performance claim. Actual pretrained 4B generation, A100 memory/speed, and learning remain unverified until the external host is available. No experiment result is claimed by this repository yet.

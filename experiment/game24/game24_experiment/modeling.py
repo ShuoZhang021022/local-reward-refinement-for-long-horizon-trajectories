@@ -212,13 +212,23 @@ def score_logprobs(model: Any, decisions: list[Decision], *,
         attention_mask[row, :len(ids)] = 1
     logits = model(input_ids=input_ids, attention_mask=attention_mask,
                    use_cache=False).logits
-    result: list[torch.Tensor] = []
+    # Score every generated position in one tensor operation. Per-row softmax
+    # launches one GPU kernel sequence per decision, which is costly for the
+    # many short Game24 responses in each rollout batch.
+    row_indices: list[int] = []
+    logit_positions: list[int] = []
+    lengths: list[int] = []
     for row, decision in enumerate(decisions):
-        prompt_length = len(decision.prompt_ids)
-        completion_length = len(decision.completion_ids)
-        token_logits = logits[row, prompt_length - 1:prompt_length + completion_length - 1].float()
-        targets = input_ids[row, prompt_length:prompt_length + completion_length]
-        result.append(F.log_softmax(token_logits, dim=-1).gather(
-            -1, targets.unsqueeze(-1),
-        ).squeeze(-1))
-    return result
+        length = len(decision.completion_ids)
+        lengths.append(length)
+        row_indices.extend([row] * length)
+        logit_positions.extend(range(len(decision.prompt_ids) - 1,
+                                     len(decision.prompt_ids) + length - 1))
+    rows = torch.tensor(row_indices, dtype=torch.long, device=device)
+    positions = torch.tensor(logit_positions, dtype=torch.long, device=device)
+    token_logits = logits[rows, positions].float()
+    targets = input_ids[rows, positions + 1]
+    logp = F.log_softmax(token_logits, dim=-1).gather(
+        -1, targets.unsqueeze(-1),
+    ).squeeze(-1)
+    return list(logp.split(lengths))

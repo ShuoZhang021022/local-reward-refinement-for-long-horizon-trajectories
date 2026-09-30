@@ -20,6 +20,41 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class AuditTests(unittest.TestCase):
+    def test_qwen_batched_sampling_logprobs_match_training_rescore(self):
+        """Check left-padded generation against the right-padded token scorer."""
+        from transformers import Qwen3Config, Qwen3ForCausalLM
+
+        torch.manual_seed(13)
+        model = Qwen3ForCausalLM(Qwen3Config(
+            vocab_size=64, hidden_size=32, intermediate_size=64, num_hidden_layers=1,
+            num_attention_heads=4, num_key_value_heads=2, head_dim=8,
+            max_position_embeddings=128, eos_token_id=63, pad_token_id=0,
+        )).eval()
+        input_ids = torch.tensor([[5, 6, 7], [0, 8, 9]])
+        attention_mask = torch.tensor([[1, 1, 1], [0, 1, 1]])
+        with torch.no_grad():
+            output = model.generate(
+                input_ids=input_ids, attention_mask=attention_mask,
+                max_new_tokens=5, do_sample=True, temperature=1.0,
+                top_p=1.0, top_k=0, eos_token_id=[63], pad_token_id=0,
+                return_dict_in_generate=True, output_scores=True,
+            )
+            decisions = [
+                SimpleNamespace(prompt_ids=[5, 6, 7],
+                                completion_ids=output.sequences[0, 3:].tolist()),
+                SimpleNamespace(prompt_ids=[8, 9],
+                                completion_ids=output.sequences[1, 3:].tolist()),
+            ]
+            rescored = score_logprobs(model, decisions, pad_id=0, device=torch.device("cpu"))
+            sampled = torch.stack([
+                torch.log_softmax(logits.float(), dim=-1).gather(
+                    1, output.sequences[:, 3 + step:4 + step],
+                ).squeeze(1)
+                for step, logits in enumerate(output.scores)
+            ], dim=1)
+        for row, actual in enumerate(rescored):
+            self.assertTrue(torch.allclose(sampled[row], actual, atol=1e-6))
+
     def test_real_transformers_chat_template_reaches_qwen_generation(self):
         """Exercise the installed tokenizer API and a real Qwen generate call."""
         from peft import LoraConfig, get_peft_model

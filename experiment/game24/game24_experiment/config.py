@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import json
+from math import isfinite
 from pathlib import Path
 
 
@@ -55,6 +56,15 @@ class ExperimentConfig:
         return config
 
     def validate(self) -> None:
+        for name in ("omega", "lambda_bonus", "beta", "clip_epsilon",
+                     "kl_coefficient", "learning_rate"):
+            value = getattr(self, name)
+            try:
+                finite = type(value) in (int, float) and isfinite(value)
+            except OverflowError:
+                finite = False
+            if not finite:
+                raise ValueError(f"{name} must be a finite number")
         if self.model_id != "Qwen/Qwen3-4B-Instruct-2507":
             raise ValueError("Unexpected model for this experiment")
         if set(self.arms) != {"baseline", "two_step"}:

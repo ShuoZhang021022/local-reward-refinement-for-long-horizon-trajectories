@@ -1,4 +1,4 @@
-"""Single-GPU on-policy Game24 training and evaluation.
+"""One-GPU-per-run on-policy Game24 training and evaluation.
 
 This is intentionally a custom objective. Library GRPO defaults do not match
 the two local method documents' action-mean, gate, overlap, and reduction rules.
@@ -10,6 +10,7 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import platform
 import random
@@ -124,9 +125,15 @@ def _attach_old_and_reference_logprobs(runner: Any, trajectories: list[Any],
             with runner.model.disable_adapter():
                 reference = score_logprobs(runner.model, chunk, pad_id=runner.pad_id,
                                            device=runner.device)
-        for decision, old_row, ref_row in zip(chunk, old, reference):
-            decision.old_logp = old_row.float().cpu().tolist()
-            decision.reference_logp = ref_row.float().cpu().tolist()
+        lengths = [len(decision.completion_ids) for decision in chunk]
+        combined = torch.cat([torch.cat(old), torch.cat(reference)]).float().cpu().tolist()
+        offset = 0
+        for decision, length in zip(chunk, lengths):
+            decision.old_logp = combined[offset:offset + length]
+            offset += length
+        for decision, length in zip(chunk, lengths):
+            decision.reference_logp = combined[offset:offset + length]
+            offset += length
 
 
 def _visits(trajectories: list[Any]) -> list[Visit]:
@@ -214,6 +221,8 @@ def _stats_record(trajectories: list[Any], advantage_batch: Any, *, arm: str) ->
 def _diagnostic_metrics(trajectories: list[Any], advantage_batch: Any, *, arm: str) -> dict:
     from collections import Counter, defaultdict
 
+    if not trajectories or not advantage_batch.advantages:
+        raise ValueError("Diagnostics require a nonempty rollout batch and advantages")
     gate_reasons = Counter(gate.reason for gate in advantage_batch.gates.values())
     advantages = list(advantage_batch.advantages.values())
     same_child_groups = 0
@@ -278,6 +287,8 @@ def _update(model: Any, optimizer: Any, trajectories: list[Any], advantage_batch
     from .modeling import score_logprobs
 
     decisions = _flatten(trajectories)
+    if not trajectories or any(not trajectory.decisions for trajectory in trajectories):
+        raise ValueError("Every training trajectory must contain at least one decision")
     lengths = {trajectory.trajectory_id: len(trajectory.decisions) for trajectory in trajectories}
     trajectories_by_visit = {
         decision.visit_id: trajectory.trajectory_id
@@ -296,10 +307,20 @@ def _update(model: Any, optimizer: Any, trajectories: list[Any], advantage_batch
     for start in range(0, len(decisions), microbatch_size):
         chunk = decisions[start:start + microbatch_size]
         current_rows = score_logprobs(model, chunk, pad_id=pad_id, device=device)
+        lengths_in_chunk = [len(decision.completion_ids) for decision in chunk]
+        old_and_reference = torch.tensor(
+            [value for decision in chunk for value in decision.old_logp] +
+            [value for decision in chunk for value in decision.reference_logp],
+            dtype=torch.float32, device=device,
+        )
+        token_total = sum(lengths_in_chunk)
+        old_rows = old_and_reference[:token_total].split(lengths_in_chunk)
+        reference_rows = old_and_reference[token_total:].split(lengths_in_chunk)
         losses = []
-        for decision, current in zip(chunk, current_rows):
-            old = torch.tensor(decision.old_logp, dtype=torch.float32, device=device)
-            reference = torch.tensor(decision.reference_logp, dtype=torch.float32, device=device)
+        audit_tensors = []
+        audit_metadata = []
+        for decision, current, old, reference in zip(
+                chunk, current_rows, old_rows, reference_rows):
             advantage = advantage_batch.advantages[decision.visit_id]
             coefficient = advantage.base if arm == "baseline" else advantage.final
             objective, token_info = decision_objective(
@@ -309,10 +330,36 @@ def _update(model: Any, optimizer: Any, trajectories: list[Any], advantage_batch
             trajectory_id = trajectories_by_visit[decision.visit_id]
             weight = 1.0 / (number_of_trajectories * lengths[trajectory_id])
             losses.append(-weight * objective)
-            weighted_objective += weight * objective.detach().item()
-            clipped_count += int(token_info["clipped"].sum().item())
-            token_count += current.numel()
-            kl_sum += float(token_info["kl"].sum().item())
+            audit_metadata.append((decision, trajectory_id, weight, coefficient))
+            audit_tensors.extend((
+                objective.detach().reshape(1),
+                token_info["clipped"].sum().reshape(1),
+                token_info["kl"].sum().reshape(1),
+                current.detach(), token_info["ratio"], token_info["policy"],
+                token_info["kl"], token_info["clipped"],
+                token_info["ratio_outside_interval"],
+            ))
+        loss = torch.stack(losses).sum()
+        if not torch.isfinite(loss):
+            raise FloatingPointError("Nonfinite loss; no update or sample skip")
+        loss.backward()
+        # Audit all scalar diagnostics and token fields with one host transfer
+        # per microbatch, instead of synchronizing the GPU for every token row.
+        audit_values = torch.cat([value.float().reshape(-1) for value in audit_tensors]).cpu().tolist()
+        offset = 0
+        for decision, trajectory_id, weight, coefficient in audit_metadata:
+            length = len(decision.completion_ids)
+            objective_value, clipped_value, kl_value = audit_values[offset:offset + 3]
+            offset += 3
+            fields = []
+            for _ in range(6):
+                fields.append(audit_values[offset:offset + length])
+                offset += length
+            current_logp, ratio, policy, kl, clipped, outside = fields
+            weighted_objective += weight * objective_value
+            clipped_count += int(clipped_value)
+            token_count += length
+            kl_sum += kl_value
             token_records.append({
                 "visit_id": decision.visit_id,
                 "trajectory_id": trajectory_id,
@@ -321,24 +368,21 @@ def _update(model: Any, optimizer: Any, trajectories: list[Any], advantage_batch
                 "token_ids": decision.completion_ids,
                 "old_logp": decision.old_logp,
                 "reference_logp": decision.reference_logp,
-                "current_logp": current.detach().float().cpu().tolist(),
-                "ratio": token_info["ratio"].float().cpu().tolist(),
-                "clipped_policy_term": token_info["policy"].float().cpu().tolist(),
-                "kl": token_info["kl"].float().cpu().tolist(),
-                "clipped_mask": token_info["clipped"].int().cpu().tolist(),
-                "ratio_outside_interval_mask": token_info["ratio_outside_interval"].int().cpu().tolist(),
+                "current_logp": current_logp,
+                "ratio": ratio,
+                "clipped_policy_term": policy,
+                "kl": kl,
+                "clipped_mask": [int(value) for value in clipped],
+                "ratio_outside_interval_mask": [int(value) for value in outside],
             })
-        loss = torch.stack(losses).sum()
-        if not torch.isfinite(loss):
-            raise FloatingPointError("Nonfinite loss; no update or sample skip")
-        loss.backward()
-    grad_squared = 0.0
-    for parameter in model.parameters():
-        if parameter.grad is not None:
-            grad_squared += float(parameter.grad.detach().float().square().sum().item())
-    grad_norm = grad_squared ** 0.5
+    grad_squares = [parameter.grad.detach().float().square().sum()
+                    for parameter in model.parameters() if parameter.grad is not None]
+    grad_norm = (torch.stack([value.double() for value in grad_squares]).sum().sqrt().item()
+                 if grad_squares else 0.0)
     if not grad_norm < float("inf"):
         raise FloatingPointError("Nonfinite gradient; no update or sample skip")
+    if token_count == 0:
+        raise ValueError("Training update has no generated tokens")
     write_jsonl_gzip(token_log_path, token_records)
     optimizer.step()
     if hasattr(model, "gradient_checkpointing_disable"):
@@ -359,8 +403,12 @@ def _update(model: Any, optimizer: Any, trajectories: list[Any], advantage_batch
 
 def _evaluate(runner: Any, puzzles: list[Any], indices: list[int], *,
               label: str, output_path: Path) -> dict:
+    if not indices:
+        raise ValueError("Evaluation requires at least one puzzle")
     selected = [(index, puzzles[index].numbers) for index in indices]
     trajectories = runner.rollout(selected, repetitions=1, label=label, do_sample=False)
+    if not trajectories:
+        raise ValueError("Evaluation rollout returned no trajectories")
     write_jsonl_gzip(output_path, (trajectory.record() for trajectory in trajectories))
     success = sum(trajectory.reward for trajectory in trajectories)
     invalid = sum(bool(trajectory.game.termination and
@@ -385,7 +433,12 @@ def run(plan_path: Path, output: Path, *, arm: str, seed: int) -> None:
     from .modeling import PolicyRunner
 
     if not torch.cuda.is_available():
-        raise RuntimeError("Formal training requires the external A100 GPU")
+        raise RuntimeError("Formal training requires a CUDA GPU")
+    if torch.cuda.device_count() != 1:
+        raise RuntimeError(
+            "Each Game24 run requires exactly one visible GPU; set CUDA_VISIBLE_DEVICES "
+            "or use game24_experiment.launch_6gpu"
+        )
     plan_bytes = plan_path.read_bytes()
     plan = json.loads(plan_bytes)
     config = _config_from_plan(plan)
@@ -419,11 +472,15 @@ def run(plan_path: Path, output: Path, *, arm: str, seed: int) -> None:
                      ("torch", "transformers", "peft", "huggingface_hub")},
         "runtime": {"python": platform.python_version(), "platform": platform.platform(),
                     "cuda": torch.version.cuda, "cudnn": torch.backends.cudnn.version(),
+                     "omp_num_threads": os.environ.get("OMP_NUM_THREADS"),
+                     "mkl_num_threads": os.environ.get("MKL_NUM_THREADS"),
                     "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
                     "cudnn_benchmark": torch.backends.cudnn.benchmark,
                     "cudnn_deterministic": torch.backends.cudnn.deterministic},
         "gpu": torch.cuda.get_device_name(0),
         "gpu_total_memory": torch.cuda.get_device_properties(0).total_memory,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "visible_gpu_count": torch.cuda.device_count(),
         "tokenizer_revision": plan["tokenizer_revision"],
         "audit_checkpoint_policy": "initial_and_every_update",
         "status": "running",
@@ -498,7 +555,11 @@ def run(plan_path: Path, output: Path, *, arm: str, seed: int) -> None:
                 "rule": "highest validation greedy pass@1; earliest update on tie",
             })
 
+    torch.cuda.reset_peak_memory_stats(device)
     validation(0)
+    manifest["initial_validation_cuda_peak_allocated_bytes"] = torch.cuda.max_memory_allocated(device)
+    manifest["initial_validation_cuda_peak_reserved_bytes"] = torch.cuda.max_memory_reserved(device)
+    write_json(output / "manifest.json", manifest)
     ordered = list(plan["split"]["train"])
     random.Random(seed).shuffle(ordered)
     write_json(output / "train_order.json", {"indices": ordered, "seed": seed})
@@ -521,6 +582,7 @@ def run(plan_path: Path, output: Path, *, arm: str, seed: int) -> None:
         if epoch:
             random.Random(seed + epoch).shuffle(ordered)
         for start in range(0, len(ordered), config.puzzles_per_update):
+            torch.cuda.reset_peak_memory_stats(device)
             update_index += 1
             indices = ordered[start:start + config.puzzles_per_update]
             selected = [(index, puzzles[index].numbers) for index in indices]
@@ -559,6 +621,8 @@ def run(plan_path: Path, output: Path, *, arm: str, seed: int) -> None:
                 validation(update_index)
             checkpoint_record = checkpoint(update_index)
             metrics["new_checkpoint_sha256"] = checkpoint_record["sha256"]
+            metrics["cuda_peak_allocated_bytes"] = torch.cuda.max_memory_allocated(device)
+            metrics["cuda_peak_reserved_bytes"] = torch.cuda.max_memory_reserved(device)
             append_jsonl(output / "updates.jsonl", metrics)
             print(f"update={update_index}/{expected_updates} "
                   f"success={metrics['successful_trajectories']}/{len(trajectories)} "
@@ -584,6 +648,16 @@ def run(plan_path: Path, output: Path, *, arm: str, seed: int) -> None:
         "selected_validation_accuracy": best_accuracy,
         "selected_checkpoint": f"checkpoints/state_{best_update:04d}.pt",
     })
+    manifest["adapter_artifacts"] = {
+        adapter: {
+            filename: {
+                "bytes": (output / adapter / filename).stat().st_size,
+                "sha256": file_sha256(output / adapter / filename),
+            }
+            for filename in ("adapter_config.json", "adapter_model.safetensors")
+        }
+        for adapter in ("best_adapter", "final_adapter")
+    }
     manifest["status"] = "complete"
     manifest["finished_utc"] = _utc_now()
     manifest["selected_update"] = best_update

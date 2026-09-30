@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from fractions import Fraction
-from math import ceil, sqrt
+from math import ceil, isfinite, sqrt
 from random import Random
 from typing import Iterable
 
@@ -25,7 +25,7 @@ class Visit:
     state: tuple[str, ...]
     action: str
     child_state: tuple[str, ...] | None
-    reward: int
+    reward: int | Fraction
 
 
 @dataclass
@@ -145,17 +145,21 @@ def compute_advantages(
     visits: Iterable[Visit], *, omega: float, lambda_bonus: float,
     beta: float, seed: int,
 ) -> AdvantageBatch:
+    if not all(isfinite(value) for value in (omega, lambda_bonus, beta)):
+        raise ValueError("Advantage coefficients must be finite")
     if omega < 0 or lambda_bonus <= 0 or beta <= 1:
         raise ValueError("Require omega >= 0, lambda > 0, beta > 1")
     rows = list(visits)
+    if not rows:
+        raise ValueError("Cannot compute advantages from an empty rollout batch")
     ids = [row.visit_id for row in rows]
     if len(ids) != len(set(ids)):
         raise ValueError("Visit IDs must be unique")
     by_state: dict[tuple[str, ...], list[Visit]] = defaultdict(list)
     by_trajectory: dict[str, list[Visit]] = defaultdict(list)
     for row in rows:
-        if row.reward not in (0, 1):
-            raise ValueError("Terminal reward must be binary")
+        if not isinstance(row.reward, (int, Fraction)) or not 0 <= row.reward <= 1:
+            raise ValueError("Terminal reward must be an exact value in [0, 1]")
         by_state[row.state].append(row)
         by_trajectory[row.trajectory_id].append(row)
 
@@ -165,12 +169,15 @@ def compute_advantages(
         for row in by_state[state]:
             grouped[row.action].append(row)
         q = {
-            action: Fraction(sum(row.reward for row in action_rows), len(action_rows))
+            action: sum((Fraction(row.reward) for row in action_rows), Fraction(0))
+                    / len(action_rows)
             for action, action_rows in grouped.items()
         }
         mean = sum(q.values(), Fraction(0)) / len(q)
         variance = sum(((value - mean) ** 2 for value in q.values()), Fraction(0)) / len(q)
         sigma = sqrt(float(variance))
+        if variance > 0 and sigma == 0:
+            raise FloatingPointError("Nonzero action-mean variance underflowed to zero")
         advantage = {
             action: (float((value - mean) / sigma) if sigma > 0 else 0.0)
             for action, value in q.items()

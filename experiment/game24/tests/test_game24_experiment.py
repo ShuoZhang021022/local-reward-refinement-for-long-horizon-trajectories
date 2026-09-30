@@ -1,4 +1,7 @@
 from fractions import Fraction
+from dataclasses import asdict, replace
+from copy import deepcopy
+from functools import lru_cache
 import unittest
 
 from game24_experiment.env import Action, Game24, INVALID, legal_actions
@@ -13,13 +16,20 @@ import random
 import torch
 from game24_experiment.loss import decision_objective
 from game24_experiment.modeling import Decision, PolicyRunner, score_logprobs, state_prompt_ids
-from game24_experiment.train import _update, _stats_record, _source_hashes, main as train_main
+from game24_experiment.train import (
+    _diagnostic_metrics, _evaluate, _update, _stats_record, _source_hashes,
+    main as train_main,
+)
 from game24_experiment.checkpoints import save_training_state, file_sha256
 from types import SimpleNamespace
 import tempfile
 from unittest.mock import patch
 from game24_experiment.train import prepare
-from game24_experiment.summarize import summarize
+from game24_experiment.summarize import _read_evaluation, summarize
+from game24_experiment.launch_6gpu import (
+    visible_gpu_ids, planned_jobs, check_gpu, require_distinct_physical_gpus,
+    worker_cpu_threads,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,16 +48,46 @@ def completed_run_fixtures(root):
             "split": split_puzzles(puzzles, digest, seed=config["split_seed"])}
     plan_bytes = (json.dumps(plan, indent=2) + "\n").encode()
 
+    @lru_cache(maxsize=None)
+    def solution(index):
+        def search(game):
+            if game.terminal:
+                return [] if game.reward == 1 else None
+            for action in legal_actions(game.values):
+                candidate = deepcopy(game)
+                command = f"{action.left} {action.right} {action.op}"
+                candidate.step(command)
+                tail = search(candidate)
+                if tail is not None:
+                    return [command, *tail]
+            return None
+
+        result = search(Game24(puzzles[index].numbers))
+        if result is None:
+            raise AssertionError(f"Fixture puzzle {index} has no solution")
+        return result
+
     def evaluation(path, indices, successes):
         calls = tokens = 0
         with gzip.open(path, "wt", encoding="utf-8") as stream:
             for offset, index in enumerate(indices):
                 reward = int(offset < successes)
-                model_calls = 3 if reward else 1
-                decisions = [{"completion_ids": [5, 1]} for _ in range(model_calls)]
-                row = {"puzzle_index": index, "reward": reward,
-                       "termination": "success" if reward else "invalid:format",
+                game = Game24(puzzles[index].numbers)
+                commands = solution(index) if reward else ["invalid"]
+                decisions = []
+                for command in commands:
+                    transition = game.step(command)
+                    decisions.append({
+                        "completion_ids": [5, 1], "ended_by_eos": True,
+                        "generated_token_mask": [1, 1],
+                        "termination_token_id": 1,
+                        "transition": asdict(transition),
+                    })
+                model_calls = len(decisions)
+                row = {"puzzle_index": index, "numbers": puzzles[index].numbers,
+                       "reward": game.reward, "termination": game.termination,
                        "steps": model_calls, "decisions": decisions,
+                       "final_expression": decisions[-1]["transition"]["expression"],
                        "model_calls": model_calls, "generated_tokens": 2 * model_calls}
                 stream.write(json.dumps(row) + "\n")
                 calls += model_calls
@@ -64,12 +104,12 @@ def completed_run_fixtures(root):
             path.mkdir()
             (path / "plan.json").write_bytes(plan_bytes)
             plan_hash = hashlib.sha256(plan_bytes).hexdigest()
-            (path / "manifest.json").write_text(json.dumps({
+            manifest = {
                 "schema_version": 2, "status": "complete", "arm": arm, "seed": seed,
                 "plan": plan, "plan_sha256": plan_hash,
                 "versions": {"fixture": "1"}, "completed_updates": 1,
                 "selected_update": 0,
-            }), encoding="utf-8")
+            }
             order = list(plan["split"]["train"])
             random.Random(seed).shuffle(order)
             (path / "train_order.json").write_text(json.dumps({"indices": order, "seed": seed}))
@@ -126,6 +166,17 @@ def completed_run_fixtures(root):
                 folder.mkdir()
                 (folder / "adapter_config.json").write_text("{}")
                 (folder / "adapter_model.safetensors").write_bytes(b"fixture")
+            manifest["adapter_artifacts"] = {
+                adapter: {
+                    filename: {
+                        "bytes": (path / adapter / filename).stat().st_size,
+                        "sha256": file_sha256(path / adapter / filename),
+                    }
+                    for filename in ("adapter_config.json", "adapter_model.safetensors")
+                }
+                for adapter in ("best_adapter", "final_adapter")
+            }
+            (path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
             test_metrics = evaluation(path / "test.jsonl.gz", plan["split"]["test"],
                                       20 if arm == "baseline" else 40)
             test_metrics.update(selected_update=0, selected_validation_accuracy=0.5,
@@ -350,12 +401,53 @@ class ConfigurationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "altered audit checkpoint"):
                 summarize(paths, bootstrap_replicates=200)
             snapshot.write_bytes(raw)
+            adapter = first / "best_adapter/adapter_model.safetensors"
+            raw = adapter.read_bytes()
+            adapter.write_bytes(b"damaged adapter")
+            with self.assertRaisesRegex(ValueError, "altered saved adapter"):
+                summarize(paths, bootstrap_replicates=200)
+            adapter.write_bytes(raw)
             selection = first / "best_selection.json"
             selected = json.loads(selection.read_text())
             selected["update"] = 1
             selection.write_text(json.dumps(selected))
             with self.assertRaisesRegex(ValueError, "Best checkpoint"):
                 summarize(paths, bootstrap_replicates=200)
+
+    def test_evaluation_audit_replays_actions_before_trusting_reward(self):
+        game = Game24([4, 5, 6, 10])
+        decisions = []
+        for command in ("4 1 -", "1 2 *", "2 1 -"):
+            decisions.append({
+                "completion_ids": [5, 1], "ended_by_eos": True,
+                "generated_token_mask": [1, 1], "termination_token_id": 1,
+                "transition": asdict(game.step(command)),
+            })
+        row = {
+            "puzzle_index": 900, "numbers": [4, 5, 6, 10],
+            "reward": 1, "termination": "success", "steps": 3,
+            "decisions": decisions, "model_calls": 3, "generated_tokens": 6,
+            "final_expression": decisions[-1]["transition"]["expression"],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "evaluation.jsonl.gz"
+
+            def audit():
+                with gzip.open(path, "wt", encoding="utf-8") as stream:
+                    stream.write(json.dumps(row) + "\n")
+                return _read_evaluation(
+                    path, [900], {900: (4, 5, 6, 10)},
+                    eos_ids={1}, max_new_tokens=32,
+                )
+
+            self.assertEqual(audit()[1]["successes"], 1)
+            row["reward"], row["termination"] = 0, "not_24"
+            with self.assertRaisesRegex(ValueError, "result disagrees with Game24"):
+                audit()
+            row["reward"], row["termination"] = 1, "success"
+            row["decisions"][0]["transition"]["raw_output"] = "1 1 +"
+            with self.assertRaisesRegex(ValueError, "transition disagrees with Game24"):
+                audit()
 
     def test_refused_output_reuse_does_not_corrupt_existing_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -412,6 +504,36 @@ class TokenTests(unittest.TestCase):
         scores = score_logprobs(FakeModel(), rows, pad_id=0, device=torch.device("cpu"))
         self.assertEqual([len(row) for row in scores], [2, 1])
         self.assertTrue(all(score.item() > -1 for row in scores for score in row))
+
+    def test_batched_scoring_matches_individual_rows_and_gradients(self):
+        class TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embedding = torch.nn.Embedding(16, 8)
+                self.output = torch.nn.Linear(8, 16)
+
+            def forward(self, input_ids, attention_mask, use_cache):
+                return SimpleNamespace(logits=self.output(self.embedding(input_ids)))
+
+        torch.manual_seed(7)
+        model = TinyModel()
+        transition = Game24([1, 2, 3, 4]).step("1 2 +")
+        decisions = [
+            Decision("a", "", [1, 2, 3], [4, 5], [], True, transition),
+            Decision("b", "", [2, 4], [3, 6, 7], [], True, transition),
+            Decision("c", "", [3, 5, 8, 9], [2], [], True, transition),
+        ]
+        batched = score_logprobs(model, decisions, pad_id=0, device=torch.device("cpu"))
+        batched_loss = sum(row.sum() for row in batched)
+        batched_grads = torch.autograd.grad(batched_loss, model.parameters())
+        individual = [score_logprobs(model, [decision], pad_id=0,
+                                     device=torch.device("cpu"))[0] for decision in decisions]
+        individual_loss = sum(row.sum() for row in individual)
+        individual_grads = torch.autograd.grad(individual_loss, model.parameters())
+        for actual, expected in zip(batched, individual):
+            self.assertTrue(torch.allclose(actual, expected, atol=1e-6))
+        for actual, expected in zip(batched_grads, individual_grads):
+            self.assertTrue(torch.allclose(actual, expected, atol=1e-6))
 
     def test_prompt_contains_current_state_and_no_history(self):
         class FakeTokenizer:
@@ -520,13 +642,19 @@ class TokenTests(unittest.TestCase):
         transition = Game24([1, 2, 3, 4]).step("1 2 +")
         decision = Decision("visit", "prompt", [1, 2], [3, 4], ["3", "4"],
                             True, transition)
+        second = Decision("visit2", "prompt", [1, 2, 3], [4], ["4"],
+                          True, transition)
         with torch.no_grad():
-            old = score_logprobs(model, [decision], pad_id=0,
-                                  device=torch.device("cpu"))[0].tolist()
-        decision.old_logp = old
-        decision.reference_logp = old
-        trajectory = SimpleNamespace(trajectory_id="trajectory", decisions=[decision])
-        advantage = SimpleNamespace(advantages={"visit": SimpleNamespace(base=1.0, final=1.5)})
+            old_rows = score_logprobs(model, [decision, second], pad_id=0,
+                                       device=torch.device("cpu"))
+        for item, old in zip((decision, second), old_rows):
+            item.old_logp = old.tolist()
+            item.reference_logp = old.tolist()
+        trajectory = SimpleNamespace(trajectory_id="trajectory", decisions=[decision, second])
+        advantage = SimpleNamespace(advantages={
+            "visit": SimpleNamespace(base=1.0, final=1.5),
+            "visit2": SimpleNamespace(base=-0.5, final=-0.75),
+        })
         config = ExperimentConfig.from_json(
             Path(__file__).resolve().parents[1] / "game24_experiment" / "experiment.json"
         )
@@ -536,10 +664,88 @@ class TokenTests(unittest.TestCase):
             path = Path(directory) / "tokens.jsonl.gz"
             metrics = _update(model, optimizer, [trajectory], advantage, arm="baseline",
                               config=config, pad_id=0, device=torch.device("cpu"),
-                              microbatch_size=1, token_log_path=path)
+                              microbatch_size=2, token_log_path=path)
             self.assertTrue(path.is_file())
-            self.assertEqual(metrics["generated_tokens"], 2)
+            self.assertEqual(metrics["generated_tokens"], 3)
+            with gzip.open(path, "rt", encoding="utf-8") as stream:
+                audit = [json.loads(line) for line in stream]
+            self.assertEqual([len(row["current_logp"]) for row in audit], [2, 1])
+            self.assertEqual([row["advantage"] for row in audit], [1.0, -0.5])
+            self.assertTrue(all(all(abs(ratio - 1) < 1e-6 for ratio in row["ratio"])
+                                for row in audit))
+            self.assertEqual([row["clipped_mask"] for row in audit], [[0, 0], [0]])
         self.assertFalse(torch.allclose(before, model.output.weight))
+
+
+class NumericalSafetyTests(unittest.TestCase):
+    def test_empty_batches_fail_before_division_or_optimizer_step(self):
+        with self.assertRaisesRegex(ValueError, "empty rollout batch"):
+            compute_advantages([], omega=1.0, lambda_bonus=0.5, beta=1.5, seed=1)
+        empty = SimpleNamespace(advantages={}, gates={}, states={})
+        with self.assertRaisesRegex(ValueError, "nonempty rollout batch"):
+            _diagnostic_metrics([], empty, arm="baseline")
+        with self.assertRaisesRegex(ValueError, "at least one puzzle"):
+            _evaluate(None, [], [], label="empty", output_path=Path("unused"))
+        config = ExperimentConfig.from_json(ROOT / "game24_experiment" / "experiment.json")
+        with self.assertRaisesRegex(ValueError, "at least one decision"):
+            _update(None, None, [], empty, arm="baseline", config=config,
+                    pad_id=0, device=torch.device("cpu"), microbatch_size=1,
+                    token_log_path=Path("unused"))
+
+    def test_nonfinite_coefficients_are_rejected(self):
+        config = ExperimentConfig.from_json(ROOT / "game24_experiment" / "experiment.json")
+        for name in ("omega", "lambda_bonus", "beta", "clip_epsilon",
+                     "kl_coefficient", "learning_rate"):
+            for value in (float("nan"), float("inf"), float("-inf")):
+                with self.subTest(name=name, value=value):
+                    with self.assertRaisesRegex(ValueError, "finite number"):
+                        replace(config, **{name: value}).validate()
+        with self.assertRaisesRegex(ValueError, "must be finite"):
+            compute_advantages([Visit("a", "t", 0, ("1",), "INVALID", None, 0)],
+                               omega=float("nan"), lambda_bonus=0.5, beta=1.5, seed=1)
+
+    def test_nonzero_variance_underflow_is_not_treated_as_zero_advantage(self):
+        state = ("1", "2", "3", "4")
+        rows = [
+            Visit("a", "ta", 0, state, "+:1:2", None, Fraction(1, 10**400)),
+            Visit("b", "tb", 0, state, "-:1:2", None, 0),
+        ]
+        with self.assertRaisesRegex(FloatingPointError, "underflowed to zero"):
+            compute_advantages(rows, omega=1.0, lambda_bonus=0.5, beta=1.5, seed=1)
+
+
+class SixGpuLauncherTests(unittest.TestCase):
+    def test_one_distinct_gpu_per_planned_arm_and_seed(self):
+        config = ExperimentConfig.from_json(ROOT / "game24_experiment" / "experiment.json")
+        ids = visible_gpu_ids("2,3,4,5,6,7")
+        jobs = planned_jobs(config, ids)
+        self.assertEqual(jobs, [
+            ("baseline", 20260926, "2"), ("two_step", 20260926, "3"),
+            ("baseline", 20260927, "4"), ("two_step", 20260927, "5"),
+            ("baseline", 20260928, "6"), ("two_step", 20260928, "7"),
+        ])
+        self.assertEqual(visible_gpu_ids(None), ["0", "1", "2", "3", "4", "5"])
+        with self.assertRaisesRegex(ValueError, "six distinct GPUs"):
+            visible_gpu_ids("0,1,2,3,4,4")
+
+    def test_gpu_preflight_rejects_too_little_memory(self):
+        result = SimpleNamespace(stdout="NVIDIA A100-SXM4-40GB, 40536, GPU-a\n")
+        with patch("game24_experiment.launch_6gpu.subprocess.run", return_value=result):
+            self.assertEqual(check_gpu("0"), ("NVIDIA A100-SXM4-40GB", 40536, "GPU-a"))
+        result.stdout = "NVIDIA A100-SXM4-40GB, 20000, GPU-a\n"
+        with patch("game24_experiment.launch_6gpu.subprocess.run", return_value=result):
+            with self.assertRaisesRegex(RuntimeError, "at least 38 GiB"):
+                check_gpu("0")
+
+    def test_gpu_aliases_are_rejected_and_cpu_threads_are_shared(self):
+        with self.assertRaisesRegex(ValueError, "same physical GPU"):
+            require_distinct_physical_gpus([
+                ("NVIDIA A100", 40536, "GPU-a"),
+                ("NVIDIA A100", 40536, "GPU-a"),
+            ])
+        with patch("game24_experiment.launch_6gpu.os.sched_getaffinity",
+                   return_value=set(range(12)), create=True):
+            self.assertEqual(worker_cpu_threads(6), 2)
 
 
 if __name__ == "__main__":
